@@ -109,18 +109,20 @@ impl ExpertModel {
         let api = hf_hub::api::sync::Api::new()?;
         let repo = api.model(cfg.model_id.clone());
 
-        let weights_path = repo.get("model.safetensors")?;
         let tokenizer_path = repo.get("tokenizer.json")?;
         let config_path = repo.get("config.json")?;
         let config_str = std::fs::read_to_string(config_path)?;
 
         let is_mamba2 = detect_mamba2(&config_str);
 
-        // Load once, at whatever dtype the checkpoint actually stores (bf16
-        // for Codestral/PromptCoT per their config.json, possibly f16/f32 for
-        // older Mamba-1 checkpoints) — hardcoding F32 here would silently
-        // upcast a 7B bf16 checkpoint to ~28GB instead of the real ~14GB.
-        let tensors = candle_core::safetensors::load(&weights_path, &device)?;
+        // Larger checkpoints (Codestral-7B, PromptCoT-Math-7B, ~14GB each)
+        // get auto-sharded by HF's upload tooling into
+        // "model-0000X-of-0000Y.safetensors" + a "model.safetensors.index.json"
+        // instead of one file — confirmed by checking both repos' actual file
+        // listings rather than assuming. load_safetensors_maybe_sharded()
+        // handles both cases uniformly.
+        let tensors = load_safetensors_maybe_sharded(&repo, &device)
+            .map_err(|e| anyhow::anyhow!("failed to load weights for expert '{}': {e}", cfg.name))?;
         let native_dtype = tensors
             .values()
             .next()
@@ -230,6 +232,47 @@ impl ExpertModel {
             * (self.backbone_cfg.d_model() as u64 * self.backbone_cfg.d_model().div_ceil(16) as u64 * 4);
         (param_count as f64 * cfg.quantization.bytes_per_param()) as u64
     }
+}
+
+/// Load a checkpoint's weights whether it ships one `model.safetensors` or
+/// is sharded across `model-0000X-of-0000Y.safetensors` files referenced by
+/// `model.safetensors.index.json` (HF's standard sharding convention for
+/// checkpoints too large for a single file — confirmed present on both
+/// Codestral-7B and PromptCoT-Math-7B by checking their real file listings).
+fn load_safetensors_maybe_sharded(
+    repo: &hf_hub::api::sync::ApiRepo,
+    device: &Device,
+) -> Result<std::collections::HashMap<String, Tensor>> {
+    if let Ok(path) = repo.get("model.safetensors") {
+        return Ok(candle_core::safetensors::load(&path, device)?);
+    }
+
+    let index_path = repo
+        .get("model.safetensors.index.json")
+        .map_err(|e| anyhow::anyhow!("no model.safetensors or index.json found: {e}"))?;
+    let index: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(index_path)?)?;
+
+    let weight_map = index
+        .get("weight_map")
+        .and_then(|w| w.as_object())
+        .ok_or_else(|| anyhow::anyhow!("index.json missing weight_map"))?;
+
+    // multiple tensors map to the same shard file — dedupe before downloading
+    let shard_files: std::collections::HashSet<&str> = weight_map
+        .values()
+        .filter_map(|v| v.as_str())
+        .collect();
+
+    tracing::info!("Loading {} shard file(s) per index.json", shard_files.len());
+
+    let mut merged = std::collections::HashMap::new();
+    for shard in shard_files {
+        let shard_path = repo.get(shard)?;
+        let shard_tensors = candle_core::safetensors::load(&shard_path, device)?;
+        merged.extend(shard_tensors);
+    }
+
+    Ok(merged)
 }
 
 /// candle's Mamba-1 `Model::new()` looks up the embedding at
