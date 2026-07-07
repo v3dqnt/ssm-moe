@@ -1,0 +1,6 @@
+/target
+*.log
+.sessions/
+adapters/
+__pycache__/
+*.pyc

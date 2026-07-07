@@ -1,0 +1,54 @@
+[package]
+name = "ssm-moe"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ssm-moe"
+path = "src/main.rs"
+
+[dependencies]
+# HuggingFace Candle — SSM/Mamba inference in pure Rust
+candle-core = { git = "https://github.com/huggingface/candle", default-features = false }
+candle-nn = { git = "https://github.com/huggingface/candle", default-features = false }
+candle-transformers = { git = "https://github.com/huggingface/candle", default-features = false }
+
+# HuggingFace model hub + tokenizers
+hf-hub = { version = "0.3", features = ["tokio"] }
+tokenizers = { version = "0.19", features = ["http"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Memory-mapped cold adapter storage
+memmap2 = "0.9"
+
+# Error handling + logging
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# LRU cache for warm adapter tier
+lru = "0.12"
+
+# Compression for warm adapter int2 tier
+zstd = "0.13"
+clap = { version = "4", features = ["derive"] }
+
+# HTTP client for the temporary bart-large-mnli router sidecar (see
+# src/brain/router.rs) — remove once the router is a native candle model.
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+
+[features]
+default = []   # cpu-only by default; add --features cuda on Linux/Colab
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
