@@ -21,7 +21,16 @@ pub struct CriticModel {
     model: MambaModel,
     mamba_cfg: MambaConfig,
     tokenizer: Tokenizer,
-    score_head: Linear,  // (hidden_size, 3) → [coherence, completion, safety]
+    /// (vocab_size, 3) → [coherence, completion, safety]. Built lazily on the
+    /// first `verify()` call: candle's `Model::forward()` returns final vocab
+    /// logits directly (its `embedding`/`layers`/`norm_f`/`lm_head` fields
+    /// are private, so we can't reach in for pre-lm_head hidden states from
+    /// outside the crate), and the model's *padded* vocab size isn't
+    /// reliably knowable ahead of time from `config.json` alone — so this
+    /// scores off the output logit distribution instead of a hidden state,
+    /// sized from whatever the first real forward pass actually produces.
+    /// Harmless since it's zero-initialized/untrained either way.
+    score_head: Option<Linear>,
     threshold: f32,
     /// Always CPU regardless of what's passed to `load()` — the critic is
     /// intentionally kept off the GPU to save VRAM for experts. `verify()`
@@ -62,13 +71,12 @@ impl CriticModel {
 
         let mamba_cfg: MambaConfig =
             serde_json::from_str(&std::fs::read_to_string(config_path)?)?;
-        let hidden_size = mamba_cfg.d_model;
 
-        // Real tensor names verified directly from the checkpoint (not
-        // guessed): prefix is "backbone." (not "model."), e.g.
-        // "backbone.embeddings.weight", "backbone.layers.0.mixer.A_log".
-        // Loaded at native dtype rather than hardcoded F32 — same reasoning
-        // as experts/model.rs.
+        // Real tensor names verified directly via safe_open against this
+        // exact checkpoint: prefix is "backbone." (not "model."), and the
+        // embedding tensor is "embeddings.weight" (plural) — but candle's
+        // Mamba-1 Model::new() looks it up as singular "embedding" under
+        // vb.pp("embedding"). Same rename as experts/model.rs.
         let tensors = candle_core::safetensors::load(&weights_path, &device)?;
         let native_dtype = tensors
             .values()
@@ -76,20 +84,22 @@ impl CriticModel {
             .map(|t| t.dtype())
             .ok_or_else(|| anyhow::anyhow!("empty safetensors file for critic checkpoint"))?;
 
+        let tensors = remap_embedding_key(tensors);
         let backbone_vb = VarBuilder::from_tensors(tensors, native_dtype, &device);
         let model = MambaModel::new(&mamba_cfg, backbone_vb.pp("backbone"))?;
-
-        // score_head has no pretrained weights — this checkpoint was never
-        // trained for scoring, so it needs a freshly zero-initialized
-        // VarBuilder rather than one backed by the checkpoint file (which
-        // would fail with "cannot find tensor score_head.weight").
-        let head_vb = VarBuilder::zeros(native_dtype, &device);
-        let score_head = linear_no_bias(hidden_size, 3, head_vb.pp("score_head"))?;
 
         let tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| anyhow::anyhow!("tokenizer load: {e}"))?;
 
-        Ok(Self { model, mamba_cfg, tokenizer, score_head, threshold, device, dtype: native_dtype })
+        Ok(Self {
+            model,
+            mamba_cfg,
+            tokenizer,
+            score_head: None,
+            threshold,
+            device,
+            dtype: native_dtype,
+        })
     }
 
     pub fn verify(&mut self, output_text: &str) -> Result<CriticVerdict> {
@@ -101,9 +111,19 @@ impl CriticModel {
         let input = Tensor::new(ids.as_slice(), &self.device)?.unsqueeze(0)?;
 
         let mut state = MambaState::new(1, &self.mamba_cfg, self.dtype, &self.device)?;
-        let hidden = self.model.forward(&input, &mut state)?;
-        let pooled = hidden.mean(1)?;  // (1, hidden_size)
-        let scores = self.score_head.forward(&pooled)?; // (1, 3)
+        // candle's Model::forward() already applies norm_f + lm_head
+        // internally and returns final vocab logits directly, shape
+        // (1, seq, vocab_size) — not raw hidden states.
+        let logits_seq = self.model.forward(&input, &mut state)?;
+        let pooled = logits_seq.mean(1)?; // (1, vocab_size)
+
+        if self.score_head.is_none() {
+            let vocab_size = pooled.dims()[1];
+            let head_vb = VarBuilder::zeros(self.dtype, &self.device);
+            self.score_head = Some(linear_no_bias(vocab_size, 3, head_vb.pp("score_head"))?);
+        }
+
+        let scores = self.score_head.as_ref().unwrap().forward(&pooled)?; // (1, 3)
         let scores = candle_nn::ops::sigmoid(&scores)?.squeeze(0)?; // (3,)
         let v: Vec<f32> = scores.to_vec1()?;
 
@@ -119,4 +139,23 @@ impl CriticModel {
             passed: composite >= self.threshold,
         })
     }
+}
+
+/// Same rename as `experts::model::remap_mamba1_embedding_key` — candle's
+/// Mamba-1 code expects singular "embedding", checkpoints store plural
+/// "embeddings". Duplicated here rather than shared since this module has
+/// no dependency on `experts::model` and the fix is a one-liner.
+fn remap_embedding_key(
+    tensors: std::collections::HashMap<String, Tensor>,
+) -> std::collections::HashMap<String, Tensor> {
+    tensors
+        .into_iter()
+        .map(|(k, v)| {
+            if let Some(prefix) = k.strip_suffix("embeddings.weight") {
+                (format!("{prefix}embedding.weight"), v)
+            } else {
+                (k, v)
+            }
+        })
+        .collect()
 }

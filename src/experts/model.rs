@@ -19,6 +19,29 @@ both declare `"architectures": ["Mamba2ForCausalLM"]` in their `config.json`
 is Mamba-1 (its config.json has no `architectures` field at all, just bare
 `d_model`/`n_layer`, the original state-spaces/mamba format). Architecture is
 detected from `config.json` at load time rather than hardcoded per expert.
+
+Two candle quirks discovered by inspecting both real checkpoints and candle's
+vendored source directly (not assumed):
+
+1. candle's `mamba::Model::new()` looks up the embedding tensor at
+   `vb.pp("embedding")` (singular), while `mamba2::Model::new()` looks it up
+   at `vb.pp("embeddings")` (plural) — the opposite of each other. The real
+   checkpoint tensor name (verified via `safe_open` on
+   `state-spaces/mamba-130m-hf`) is `backbone.embeddings.weight` (plural).
+   So Mamba-1 checkpoints need a key rename before their tensor map is handed
+   to candle; Mamba-2 checkpoints already match. Handled in `remap_for_candle`.
+
+2. Both `mamba::Model::forward()` and `mamba2::Model::forward()` already
+   apply `norm_f` and an internal `lm_head` and return final vocab logits
+   directly — there is no separate lm_head step needed on our side. However,
+   candle's internal `lm_head` is *always* tied to the embedding weights
+   (`Linear::from_weights(embedding.embeddings().clone(), None)`), with no
+   option to use an untied one. Codestral's `config.json` declares
+   `"tie_word_embeddings": false`, meaning it has a real, separately-trained
+   output head that candle currently ignores in favor of this tied
+   approximation. Generation from Codestral will be structurally correct but
+   not use its actual trained output projection until candle's mamba2.rs is
+   patched to support untied heads — tracked as follow-up work, not hidden.
 */
 
 use anyhow::Result;
@@ -69,7 +92,6 @@ pub struct ExpertModel {
     backbone: Backbone,
     backbone_cfg: BackboneConfig,
     tokenizer: Tokenizer,
-    lm_head: Tensor,
     device: Device,
     /// The checkpoint's native storage dtype — recurrent state tensors must
     /// match this or `forward()` hits dtype mismatches during matmuls.
@@ -107,7 +129,16 @@ impl ExpertModel {
 
         tracing::info!("Expert '{}' native dtype: {native_dtype:?}", cfg.name);
 
-        let vb = VarBuilder::from_tensors(tensors.clone(), native_dtype, &device);
+        // candle's Mamba-1 expects "embedding" (singular) under vb.pp("embedding");
+        // Mamba-2 expects "embeddings" (plural) — the real checkpoint tensor is
+        // always plural, so only Mamba-1 needs a rename before building the vb.
+        let tensors = if is_mamba2 {
+            tensors
+        } else {
+            remap_mamba1_embedding_key(tensors)
+        };
+
+        let vb = VarBuilder::from_tensors(tensors, native_dtype, &device);
 
         let (backbone, backbone_cfg) = if is_mamba2 {
             let mamba_cfg: Mamba2Config = serde_json::from_str(&config_str)?;
@@ -119,14 +150,6 @@ impl ExpertModel {
             (Backbone::Mamba1(model), BackboneConfig::Mamba1(mamba_cfg))
         };
 
-        // lm_head is usually tied to the input embedding in Mamba checkpoints
-        let lm_head = tensors
-            .get("lm_head.weight")
-            .or_else(|| tensors.get("embedding.weight"))
-            .or_else(|| tensors.get("backbone.embedding.weight"))
-            .ok_or_else(|| anyhow::anyhow!("no lm_head or tied embedding weight found for expert '{}'", cfg.name))?
-            .clone();
-
         let tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| anyhow::anyhow!("tokenizer load failed for '{}': {e}", cfg.name))?;
 
@@ -135,7 +158,6 @@ impl ExpertModel {
             backbone,
             backbone_cfg,
             tokenizer,
-            lm_head,
             device,
             dtype: native_dtype,
         })
@@ -177,12 +199,15 @@ impl ExpertModel {
 
         for _ in 0..max_new_tokens {
             let input = Tensor::new(ids.as_slice(), &self.device)?.unsqueeze(0)?;
-            let hidden = self.forward(&input, &mut state)?;
+            // candle's Model::forward() already applies norm_f + lm_head
+            // internally and returns final vocab logits directly — no
+            // separate lm_head matmul needed (see module doc comment re:
+            // the tied-embedding approximation this implies for Codestral).
+            let logits_seq = self.forward(&input, &mut state)?; // (1, seq, vocab)
 
-            let last_hidden = hidden.i((.., hidden.dims()[1] - 1, ..))?;
-            let logits = last_hidden.matmul(&self.lm_head.t()?)?.squeeze(0)?;
+            let last_logits = logits_seq.i((.., logits_seq.dims()[1] - 1, ..))?.squeeze(0)?; // (vocab,)
 
-            let next_id = sample(&logits, temperature)?;
+            let next_id = sample(&last_logits, temperature)?;
             ids.push(next_id);
 
             if Some(next_id) == eos_id {
@@ -205,6 +230,27 @@ impl ExpertModel {
             * (self.backbone_cfg.d_model() as u64 * self.backbone_cfg.d_model().div_ceil(16) as u64 * 4);
         (param_count as f64 * cfg.quantization.bytes_per_param()) as u64
     }
+}
+
+/// candle's Mamba-1 `Model::new()` looks up the embedding at
+/// `vb.pp("embedding")` (singular), but real checkpoints store it as
+/// `embeddings.weight` (plural) — verified directly via `safe_open` against
+/// `state-spaces/mamba-130m-hf`. Rename any `*.embeddings.weight` key to
+/// `*.embedding.weight` (dropping the 's', preserving any prefix like
+/// `backbone.`) so candle's fixed lookup path finds it.
+fn remap_mamba1_embedding_key(
+    tensors: std::collections::HashMap<String, Tensor>,
+) -> std::collections::HashMap<String, Tensor> {
+    tensors
+        .into_iter()
+        .map(|(k, v)| {
+            if let Some(prefix) = k.strip_suffix("embeddings.weight") {
+                (format!("{prefix}embedding.weight"), v)
+            } else {
+                (k, v)
+            }
+        })
+        .collect()
 }
 
 /// Detect Mamba-2 vs Mamba-1 from a checkpoint's raw `config.json`. HF Mamba-2
