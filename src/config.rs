@@ -112,6 +112,12 @@ pub struct MoEConfig {
     /// prompt + generated tokens must all fit). Generous default since these
     /// are 7B-class experts with no KV-cache growth concerns beyond memory.
     pub n_ctx: u32,
+
+    /// Generate this many candidates per selected expert and keep the one
+    /// the Critic scores highest, instead of a single generation. `1`
+    /// (default) reproduces today's behavior exactly; training-free quality
+    /// lever at the cost of N× generation compute per expert.
+    pub best_of_n: usize,
 }
 
 impl Default for MoEConfig {
@@ -211,6 +217,7 @@ impl Default for MoEConfig {
             max_new_tokens: 2048,
             temperature: 0.7,
             n_ctx: 8192,
+            best_of_n: 1,
         }
     }
 }

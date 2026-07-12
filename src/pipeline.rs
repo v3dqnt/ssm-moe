@@ -7,7 +7,8 @@ Full forward pass:
     → Brain Router   (gate logits)
     → Adaptive-K Gate (select K experts)
     → Registry       (promote experts to hot tier)
-    → Expert forward passes (llama.cpp, one GGUF model per expert)
+    → Expert forward passes (llama.cpp, one GGUF model per expert,
+                              best_of_n candidates reranked by the Critic)
     → Confidence check (activates the next-ranked unselected expert as
                         backup for any low-confidence output)
     → Fusion         (text-level weighted blend)
@@ -15,6 +16,8 @@ Full forward pass:
     → Per-expert state write (session memory for next turn)
     → Output
 */
+
+use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
 use tracing::{info, warn};
@@ -26,7 +29,7 @@ use crate::{
         router::{BartSidecarRouter, Router},
     },
     config::{MoEConfig, RouterBackend},
-    experts::registry::ExpertRegistry,
+    experts::{model::GenerationOutput, registry::ExpertRegistry},
     layers::{confidence, critic::CriticModel, fusion::text_fuse},
     memory::context::ContextMemory,
 };
@@ -140,10 +143,14 @@ impl MoEPipeline {
 
         // 2. Adaptive-K Gate → selected experts
         let gate = adaptive_k_gate(&gate_logits, self.config.k_max, 0.05);
-        let selected_names: Vec<&str> = gate
+        // Owned, not `Vec<&str>` borrowing `self.config`: the main
+        // generation loop below calls `self.generate_best_of_n`, which
+        // needs `&mut self`, and a live borrow of `self.config` here would
+        // conflict with that.
+        let selected_names: Vec<String> = gate
             .expert_indices
             .iter()
-            .map(|&i| self.config.expert_names()[i])
+            .map(|&i| self.config.expert_names()[i].to_string())
             .collect();
 
         info!(
@@ -152,26 +159,22 @@ impl MoEPipeline {
         );
 
         // 3. Promote selected experts, hibernate rest
-        self.registry.evict_except(&selected_names);
-        for name in &selected_names {
+        let selected_refs: Vec<&str> = selected_names.iter().map(String::as_str).collect();
+        self.registry.evict_except(&selected_refs);
+        for name in &selected_refs {
             self.registry.activate(name)?;
         }
 
         // 4. Run each active expert. Single active expert is the common case
         // (adaptive-K biases toward k=1 for confident routing, and config
         // defaults k_max=1 for the 8GB VRAM budget) so this is usually one pass.
+        // `generate_best_of_n` reproduces a single generation exactly when
+        // `config.best_of_n == 1` (the default).
         let mut expert_outputs: Vec<(String, String)> = Vec::with_capacity(selected_names.len());
         let mut fusion_weights: Vec<f32> = Vec::with_capacity(selected_names.len());
         let mut confidence_scores: Vec<(String, f32)> = Vec::with_capacity(selected_names.len());
         for (name, &weight) in selected_names.iter().zip(gate.expert_weights.iter()) {
-            let expert = self.registry.activate(name)?;
-            let state_path = self.context.path(name);
-            let generation = expert.generate(
-                prompt,
-                self.config.max_new_tokens,
-                self.config.temperature,
-                &state_path,
-            )?;
+            let generation = self.generate_best_of_n(name, prompt)?;
 
             let score = confidence::score(&generation.token_logprobs);
             confidence_scores.push((name.to_string(), score));
@@ -223,5 +226,59 @@ impl MoEPipeline {
         let verdict = self.critic.verify(&fused)?;
 
         Ok((fused, verdict))
+    }
+
+    /// Generate from expert `name`, running `config.best_of_n` candidates
+    /// and keeping the one the Critic scores highest when `best_of_n > 1`.
+    /// `best_of_n == 1` (the default) is exactly today's single generation,
+    /// same cost as before this existed.
+    ///
+    /// Each candidate reads from a scratch copy of the expert's session
+    /// state file rather than the real one, so candidates don't clobber
+    /// each other's view of prior-turn state; only the winning candidate's
+    /// resulting state is copied back to the real path afterward.
+    fn generate_best_of_n(&mut self, name: &str, prompt: &str) -> Result<GenerationOutput> {
+        let expert = self.registry.activate(name)?;
+        let state_path = self.context.path(name);
+        let n = self.config.best_of_n.max(1);
+
+        if n == 1 {
+            return expert.generate(prompt, self.config.max_new_tokens, self.config.temperature, &state_path);
+        }
+
+        let mut best: Option<(f32, GenerationOutput, PathBuf)> = None;
+        let mut candidate_paths: Vec<PathBuf> = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let candidate_path = state_path.with_extension(format!("cand{i}"));
+            if state_path.exists() {
+                std::fs::copy(&state_path, &candidate_path)?;
+            }
+            candidate_paths.push(candidate_path.clone());
+
+            let generation = expert.generate(
+                prompt,
+                self.config.max_new_tokens,
+                self.config.temperature,
+                &candidate_path,
+            )?;
+            let verdict = self.critic.verify(&generation.text)?;
+
+            let is_better = match &best {
+                Some((score, _, _)) => verdict.composite > *score,
+                None => true,
+            };
+            if is_better {
+                best = Some((verdict.composite, generation, candidate_path));
+            }
+        }
+
+        let (_, generation, winner_path) = best.expect("n > 1 guarantees at least one candidate");
+        std::fs::copy(&winner_path, &state_path)?;
+        for p in candidate_paths {
+            let _ = std::fs::remove_file(p);
+        }
+
+        Ok(generation)
     }
 }
