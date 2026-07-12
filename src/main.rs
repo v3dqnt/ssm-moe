@@ -1,4 +1,5 @@
 mod brain {
+    pub mod decompose;
     pub mod gate;
     pub mod native_router;
     pub mod router;

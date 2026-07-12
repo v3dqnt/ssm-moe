@@ -3,7 +3,10 @@ SSM MoE Pipeline — top-level orchestrator.
 
 Full forward pass:
   Prompt
-    → Decomposition (TODO: implement sub-task splitting)
+    → Decomposition (splits into independent sub-tasks when the prompt
+                      structurally supports it; passes through unchanged
+                      otherwise — see brain/decompose.rs)
+    → [ per sub-task: ]
     → Brain Router   (gate logits)
     → Adaptive-K Gate (select K experts)
     → Registry       (promote experts to hot tier)
@@ -24,6 +27,7 @@ use tracing::{info, warn};
 
 use crate::{
     brain::{
+        decompose::{Decomposer, RuleBasedDecomposer},
         gate::adaptive_k_gate,
         native_router::NativeRouter,
         router::{BartSidecarRouter, Router},
@@ -37,6 +41,7 @@ use crate::{
 pub struct MoEPipeline {
     config: MoEConfig,
     brain: Box<dyn Router>,
+    decomposer: Box<dyn Decomposer>,
     registry: ExpertRegistry,
     critic: CriticModel,
     context: ContextMemory,
@@ -100,6 +105,7 @@ impl MoEPipeline {
         Ok(Self {
             config,
             brain,
+            decomposer: Box::new(RuleBasedDecomposer),
             registry,
             critic,
             context,
@@ -137,6 +143,35 @@ impl MoEPipeline {
     }
 
     fn try_run(&mut self, prompt: &str) -> Result<(String, crate::layers::critic::CriticVerdict)> {
+        // 0. Decomposition — most prompts aren't split (see
+        // brain/decompose.rs's doc comment on why that's the deliberately
+        // conservative default), so this is a single-element Vec in the
+        // common case and `run_single` below runs exactly once.
+        let sub_prompts = self.decomposer.decompose(prompt);
+
+        let fused = if sub_prompts.len() <= 1 {
+            self.run_single(prompt)?
+        } else {
+            info!("Decomposed prompt into {} sub-task(s)", sub_prompts.len());
+            let mut parts = Vec::with_capacity(sub_prompts.len());
+            for (i, sub_prompt) in sub_prompts.iter().enumerate() {
+                let part = self.run_single(sub_prompt)?;
+                parts.push(format!("[{}/{}] {sub_prompt}\n{part}", i + 1, sub_prompts.len()));
+            }
+            parts.join("\n\n")
+        };
+
+        // Final Critic verification runs once, on the joined result — same
+        // pass/fail/retry contract as the single-prompt case.
+        let verdict = self.critic.verify(&fused)?;
+
+        Ok((fused, verdict))
+    }
+
+    /// Route → gate → generate → confidence/backup → fuse for a single
+    /// (sub-)prompt. Returns the fused text; `try_run` handles Critic
+    /// verification once over the (possibly multi-sub-task) result.
+    fn run_single(&mut self, prompt: &str) -> Result<String> {
         // 1. Brain Router → gate logits. The BART sidecar is stateless, so
         // unlike experts/critic there's no cross-turn state to load here.
         let gate_logits = self.brain.route(prompt)?;
@@ -222,10 +257,7 @@ impl MoEPipeline {
         // 5. Fuse (text-level — see layers/fusion.rs doc comment)
         let fused = text_fuse(&expert_outputs, &fusion_weights);
 
-        // 6. Critic verification
-        let verdict = self.critic.verify(&fused)?;
-
-        Ok((fused, verdict))
+        Ok(fused)
     }
 
     /// Generate from expert `name`, running `config.best_of_n` candidates
