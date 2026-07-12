@@ -8,7 +8,8 @@ Full forward pass:
     → Adaptive-K Gate (select K experts)
     → Registry       (promote experts to hot tier)
     → Expert forward passes (llama.cpp, one GGUF model per expert)
-    → Confidence check (logs low-confidence experts)
+    → Confidence check (activates the next-ranked unselected expert as
+                        backup for any low-confidence output)
     → Fusion         (text-level weighted blend)
     → Critic         (verify or re-route)
     → Per-expert state write (session memory for next turn)
@@ -160,8 +161,9 @@ impl MoEPipeline {
         // (adaptive-K biases toward k=1 for confident routing, and config
         // defaults k_max=1 for the 8GB VRAM budget) so this is usually one pass.
         let mut expert_outputs: Vec<(String, String)> = Vec::with_capacity(selected_names.len());
+        let mut fusion_weights: Vec<f32> = Vec::with_capacity(selected_names.len());
         let mut confidence_scores: Vec<(String, f32)> = Vec::with_capacity(selected_names.len());
-        for name in &selected_names {
+        for (name, &weight) in selected_names.iter().zip(gate.expert_weights.iter()) {
             let expert = self.registry.activate(name)?;
             let state_path = self.context.path(name);
             let generation = expert.generate(
@@ -174,15 +176,48 @@ impl MoEPipeline {
             let score = confidence::score(&generation.token_logprobs);
             confidence_scores.push((name.to_string(), score));
             expert_outputs.push((name.to_string(), generation.text));
+            fusion_weights.push(weight);
         }
 
-        let low_confidence = confidence::check_confidence(&confidence_scores, self.config.confidence_threshold);
+        // 4b. Backup expert(s): for anything below confidence_threshold,
+        // pull the next-ranked *unselected* candidate off the gate's full
+        // ranking and run it too, folding it into fusion alongside the
+        // shaky output so the Critic sees both.
+        let low_confidence =
+            confidence::check_confidence(&confidence_scores, self.config.confidence_threshold);
         if !low_confidence.is_empty() {
-            warn!("Low-confidence expert output(s): {low_confidence:?}");
+            let expert_names_all = self.config.expert_names();
+            let mut already_used: std::collections::HashSet<usize> =
+                gate.expert_indices.iter().copied().collect();
+
+            for low_name in &low_confidence {
+                let Some(&(backup_idx, backup_weight)) =
+                    gate.all_ranked.iter().find(|(idx, _)| !already_used.contains(idx))
+                else {
+                    warn!("Low-confidence '{low_name}' but no backup expert candidate remains");
+                    continue;
+                };
+                already_used.insert(backup_idx);
+
+                let backup_name = expert_names_all[backup_idx];
+                warn!("Low-confidence '{low_name}' — activating backup '{backup_name}'");
+
+                let expert = self.registry.activate(backup_name)?;
+                let state_path = self.context.path(backup_name);
+                let generation = expert.generate(
+                    prompt,
+                    self.config.max_new_tokens,
+                    self.config.temperature,
+                    &state_path,
+                )?;
+
+                expert_outputs.push((backup_name.to_string(), generation.text));
+                fusion_weights.push(backup_weight);
+            }
         }
 
         // 5. Fuse (text-level — see layers/fusion.rs doc comment)
-        let fused = text_fuse(&expert_outputs, &gate.expert_weights);
+        let fused = text_fuse(&expert_outputs, &fusion_weights);
 
         // 6. Critic verification
         let verdict = self.critic.verify(&fused)?;

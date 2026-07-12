@@ -16,6 +16,11 @@ pub struct GateOutput {
     pub k: usize,
     /// Normalised entropy [0, 1] — 0 = certain, 1 = uniform.
     pub entropy: f32,
+    /// Every expert index ranked by gate probability, most likely first —
+    /// a superset of `expert_indices`. Lets callers (see `pipeline.rs`'s
+    /// backup-expert path) find the next-best *unselected* candidate
+    /// without re-deriving the ranking themselves.
+    pub all_ranked: Vec<(usize, f32)>,
 }
 
 /// Select K experts dynamically based on gate entropy.
@@ -47,6 +52,7 @@ pub fn adaptive_k_gate(gate_logits: &[f32], k_max: usize, min_weight: f32) -> Ga
     // top-k indices by probability
     let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
     indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let all_ranked = indexed.clone();
     let topk: Vec<(usize, f32)> = indexed.into_iter().take(k).collect();
 
     // prune near-zero weights
@@ -67,6 +73,7 @@ pub fn adaptive_k_gate(gate_logits: &[f32], k_max: usize, min_weight: f32) -> Ga
         expert_indices,
         expert_weights,
         entropy,
+        all_ranked,
     }
 }
 
