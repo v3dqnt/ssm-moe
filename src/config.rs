@@ -66,6 +66,11 @@ pub struct MoEConfig {
     /// CPU-resident base model — kept off the K_max expert budget).
     pub critic_gguf_repo: String,
     pub critic_gguf_file: String,
+    /// Path to a trained `LinearHead` (see `layers/linear_head.rs`) scoring
+    /// (coherence, completion, safety) off the critic's pooled embedding of
+    /// the fused output. `None` (the default until this is trained) falls
+    /// back to the logprob/keyword heuristic in `layers/critic.rs`.
+    pub critic_head_path: Option<PathBuf>,
 
     // expert pool — each is a full pretrained checkpoint pulled from HF Hub
     pub experts: Vec<ExpertConfig>,
@@ -110,6 +115,10 @@ impl Default for MoEConfig {
             // verify before relying on this in production).
             critic_gguf_repo: "devingulliver/mamba-gguf".into(),
             critic_gguf_file: "mamba-130m-q8_0.gguf".into(),
+            // No trained head yet — falls back to the heuristic scorer.
+            // Point this at an SMHD file (see scripts/export_linear_head.py)
+            // once you've trained one.
+            critic_head_path: None,
 
             experts: vec![
                 // Real, existing Mamba-2 GGUF conversion — confirmed present

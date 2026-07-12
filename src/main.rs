@@ -11,6 +11,7 @@ mod layers {
     pub mod confidence;
     pub mod critic;
     pub mod fusion;
+    pub mod linear_head;
 }
 mod memory {
     pub mod context;

@@ -66,6 +66,7 @@ impl MoEPipeline {
             &config.critic_gguf_file,
             config.critic_threshold,
             config.n_ctx,
+            config.critic_head_path.as_deref(),
         )
         .await?;
 
