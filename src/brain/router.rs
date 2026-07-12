@@ -1,23 +1,26 @@
 /*!
-Brain Router — temporary HTTP client for the bart-large-mnli sidecar.
+Brain Router — trait plus the BART sidecar implementation.
 
-Neither candle nor llama.cpp has a BART implementation, so the zero-shot
-classifier that scores prompts against the expert pool runs as a small local
-Python process (`router_server.py`) instead of natively in Rust. This client
-just posts the prompt and gets back per-expert scores.
-
-This is scaffolding, not the final design: once an SSM-based router is
-trained and loadable directly, this file is replaced with a native forward
-pass and `router_server.py` is deleted. The `Vec<f32>` return type is a
-plain, framework-agnostic gate-logits vector for exactly that reason — it
-doesn't need to change when that swap happens, unlike a `Tensor` tied to a
-specific inference framework.
+`Router` is the seam this file's own history has been pointing at since the
+first commit: `BartSidecarRouter` wraps the temporary HTTP client to the
+`bart-large-mnli` zero-shot classifier (`router_server.py`) — neither candle
+nor llama.cpp has a BART implementation, so it runs as a small local Python
+process instead of natively in Rust. `NativeRouter`
+(`brain/native_router.rs`) is the trained, no-Python-required alternative
+once a router head exists; `MoEConfig.router_backend` picks between them.
 */
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::MoEConfig;
+
+/// Scores a prompt against the expert pool, returning per-expert gate
+/// logits. `Vec<f32>` is a plain, framework-agnostic representation on
+/// purpose — neither implementation needs to agree on a tensor type.
+pub trait Router: Send {
+    fn route(&mut self, prompt: &str) -> Result<Vec<f32>>;
+}
 
 #[derive(Serialize)]
 struct RouteRequest<'a> {
@@ -31,17 +34,17 @@ struct RouteResponse {
     scores: Vec<f32>,
 }
 
-pub struct BrainRouter {
+pub struct BartSidecarRouter {
     http: reqwest::blocking::Client,
     endpoint: String,
     n_experts: usize,
 }
 
-impl BrainRouter {
+impl BartSidecarRouter {
     /// `config` is kept as a parameter (rather than just an endpoint string)
-    /// so swapping back to a native model later is a signature-compatible
-    /// change at call sites. Deliberately synchronous (not `async fn`): it uses
-    /// `reqwest::blocking`, which must never run on a tokio executor thread.
+    /// for parity with `NativeRouter::load`. Deliberately synchronous (not
+    /// `async fn`): it uses `reqwest::blocking`, which must never run on a
+    /// tokio executor thread.
     pub fn load(config: &MoEConfig) -> Result<Self> {
         let endpoint = std::env::var("BRAIN_ROUTER_ENDPOINT")
             .unwrap_or_else(|_| "http://127.0.0.1:8008".to_string());
@@ -70,11 +73,12 @@ impl BrainRouter {
             n_experts: config.n_experts(),
         })
     }
+}
 
-    /// Score a prompt against the expert pool. The BART sidecar is
-    /// stateless, so unlike the experts/critic there's no cross-turn state
-    /// to load or save here.
-    pub fn forward(&mut self, prompt: &str) -> Result<Vec<f32>> {
+impl Router for BartSidecarRouter {
+    /// The BART sidecar is stateless, so unlike the experts/critic there's
+    /// no cross-turn state to load or save here.
+    fn route(&mut self, prompt: &str) -> Result<Vec<f32>> {
         let url = format!("{}/route", self.endpoint);
         let resp: RouteResponse = self
             .http

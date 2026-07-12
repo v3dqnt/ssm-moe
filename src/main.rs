@@ -1,5 +1,6 @@
 mod brain {
     pub mod gate;
+    pub mod native_router;
     pub mod router;
 }
 mod config;

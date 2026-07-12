@@ -15,12 +15,16 @@ Full forward pass:
     → Output
 */
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use tracing::{info, warn};
 
 use crate::{
-    brain::{gate::adaptive_k_gate, router::BrainRouter},
-    config::MoEConfig,
+    brain::{
+        gate::adaptive_k_gate,
+        native_router::NativeRouter,
+        router::{BartSidecarRouter, Router},
+    },
+    config::{MoEConfig, RouterBackend},
     experts::registry::ExpertRegistry,
     layers::{confidence, critic::CriticModel, fusion::text_fuse},
     memory::context::ContextMemory,
@@ -28,7 +32,7 @@ use crate::{
 
 pub struct MoEPipeline {
     config: MoEConfig,
-    brain: BrainRouter,
+    brain: Box<dyn Router>,
     registry: ExpertRegistry,
     critic: CriticModel,
     context: ContextMemory,
@@ -44,7 +48,24 @@ impl MoEPipeline {
         let n_gpu_layers: u32 = if cfg!(feature = "cuda") { 1000 } else { 0 };
         info!("Initialising SSM MoE pipeline (n_gpu_layers={n_gpu_layers})");
 
-        let brain = BrainRouter::load(&config)?;
+        let brain: Box<dyn Router> = match config.router_backend {
+            RouterBackend::BartSidecar => Box::new(BartSidecarRouter::load(&config)?),
+            RouterBackend::Native => {
+                let head_path = config.native_router_head_path.as_deref().context(
+                    "router_backend = Native requires native_router_head_path to be set",
+                )?;
+                Box::new(
+                    NativeRouter::load(
+                        &config.native_router_gguf_repo,
+                        &config.native_router_gguf_file,
+                        head_path,
+                        config.n_ctx,
+                        config.n_experts(),
+                    )
+                    .await?,
+                )
+            }
+        };
 
         let registry = ExpertRegistry::new(
             config.adapters_dir.clone(),
@@ -114,7 +135,7 @@ impl MoEPipeline {
     fn try_run(&mut self, prompt: &str) -> Result<(String, crate::layers::critic::CriticVerdict)> {
         // 1. Brain Router → gate logits. The BART sidecar is stateless, so
         // unlike experts/critic there's no cross-turn state to load here.
-        let gate_logits = self.brain.forward(prompt)?;
+        let gate_logits = self.brain.route(prompt)?;
 
         // 2. Adaptive-K Gate → selected experts
         let gate = adaptive_k_gate(&gate_logits, self.config.k_max, 0.05);

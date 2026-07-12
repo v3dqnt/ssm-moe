@@ -52,15 +52,34 @@ impl ExpertConfig {
     }
 }
 
+/// Which `brain::router::Router` implementation `MoEPipeline` constructs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RouterBackend {
+    /// `BartSidecarRouter` — external Python zero-shot classifier process.
+    BartSidecar,
+    /// `NativeRouter` — trained `LinearHead` on a small GGUF model's pooled
+    /// prompt embedding. Requires `native_router_head_path` to be set.
+    Native,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MoEConfig {
+    pub router_backend: RouterBackend,
+
     // Router: bart-large-mnli zero-shot classifier — no fine-tuning needed,
     // already validated against sanity prompts during dataset labeling.
-    // Still an external Python sidecar (see brain/router.rs) — untouched by
-    // the candle -> llama.cpp migration.
+    // Still an external Python sidecar (see brain/router.rs) — only used
+    // when router_backend == BartSidecar.
     pub brain_model_id: String,
     pub brain_labels: Vec<String>,
     pub brain_threshold: f32,
+
+    /// HF repo/file hosting a small GGUF model for `NativeRouter`'s
+    /// embeddings, plus the trained head mapping them to gate logits. Only
+    /// used when router_backend == Native.
+    pub native_router_gguf_repo: String,
+    pub native_router_gguf_file: String,
+    pub native_router_head_path: Option<PathBuf>,
 
     /// HF repo hosting the critic's GGUF conversion (small, always
     /// CPU-resident base model — kept off the K_max expert budget).
@@ -98,6 +117,10 @@ pub struct MoEConfig {
 impl Default for MoEConfig {
     fn default() -> Self {
         Self {
+            // No native router trained yet — stay on the BART sidecar until
+            // native_router_head_path is set and router_backend flipped.
+            router_backend: RouterBackend::BartSidecar,
+
             brain_model_id: "facebook/bart-large-mnli".into(),
             brain_labels: vec![
                 "coding".into(),
@@ -107,6 +130,14 @@ impl Default for MoEConfig {
                 "general".into(),
             ],
             brain_threshold: 0.65, // matches the threshold tuned during dataset labeling
+
+            // Placeholders until a native router is trained — reuses the
+            // same small GGUF conversion as the critic (see critic_gguf_*
+            // below) since only its embeddings are needed here, not its
+            // generation quality.
+            native_router_gguf_repo: "devingulliver/mamba-gguf".into(),
+            native_router_gguf_file: "mamba-130m-q8_0.gguf".into(),
+            native_router_head_path: None,
 
             // devingulliver/mamba-gguf hosts community GGUF conversions of the
             // state-spaces/mamba checkpoints at several sizes — filename
