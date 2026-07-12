@@ -1,47 +1,23 @@
 /*!
-Persistent SSM context memory.
+Persistent SSM context memory — path resolver only.
 
-The Mamba hidden state is a fixed-size tensor that summarises all prior context.
-We write it to disk after every turn and restore it at the start of the next —
-giving the Brain implicit conversation memory with zero extra tokens.
+llama.cpp's own `LlamaContext::state_seq_save_file` / `state_seq_load_file`
+(see `llama-cpp-2`'s `context/session.rs`) already serialize a sequence's
+recurrent/KV state to a single opaque file — `LlamaStateSeqFlags::PARTIAL_ONLY`
+is even documented upstream as existing specifically for "SWA KV cache or
+recurrent cache (e.g. Mamba)". That does everything the old hand-rolled
+`ModelState`/`LayerState` byte layout was trying to reimplement (and never
+actually populated — `ExpertModel::generate()` used to always return
+`ModelState::default()`).
 
-Struct on disk:
-  [4 bytes: n_layers][for each layer: [conv_state bytes][ssm_state bytes]]
+So this module no longer owns a state *format* — it just hands out a
+deterministic file path per `(session_id, key)` for `experts/model.rs` and
+`layers/critic.rs` to save/load llama.cpp session state directly against.
 */
 
-use std::{
-    collections::HashMap,
-    fs,
-    io::{Read, Write},
-    path::{Path, PathBuf},
-};
+use std::{fs, path::PathBuf};
 
 use anyhow::Result;
-use candle_core::Tensor;
-use serde::{Deserialize, Serialize};
-
-/// One layer's SSM hidden state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LayerState {
-    /// Conv1d state — shape: (batch, d_inner, d_conv - 1)
-    pub conv_state: Vec<f32>,
-    pub conv_shape: Vec<usize>,
-    /// SSM state — shape: (batch, d_inner, d_state)
-    pub ssm_state: Vec<f32>,
-    pub ssm_shape: Vec<usize>,
-}
-
-/// Full model context: one LayerState per layer.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ModelState {
-    pub layers: Vec<LayerState>,
-}
-
-impl ModelState {
-    pub fn is_empty(&self) -> bool {
-        self.layers.is_empty()
-    }
-}
 
 pub struct ContextMemory {
     session_id: String,
@@ -55,27 +31,16 @@ impl ContextMemory {
         Ok(Self { session_id: session_id.into(), storage_dir })
     }
 
-    fn path(&self, key: &str) -> PathBuf {
-        self.storage_dir.join(format!("{}_{}.bin", self.session_id, key))
+    /// Deterministic path for a given state key (e.g. an expert or critic
+    /// name) within this session. Callers save/load llama.cpp session state
+    /// directly against this path — it may or may not exist yet.
+    pub fn path(&self, key: &str) -> PathBuf {
+        self.storage_dir.join(format!("{}_{}.llama-state", self.session_id, key))
     }
 
-    /// Serialize a model's hidden state to disk.
-    pub fn save(&self, key: &str, state: &ModelState) -> Result<()> {
-        let bytes = bincode_encode(state)?;
-        fs::write(self.path(key), &bytes)?;
-        tracing::debug!("Saved {} state ({} bytes)", key, bytes.len());
-        Ok(())
-    }
-
-    /// Restore a model's hidden state from disk. Returns empty state if not found.
-    pub fn load(&self, key: &str) -> Result<ModelState> {
-        let p = self.path(key);
-        if !p.exists() {
-            return Ok(ModelState::default());
-        }
-        let bytes = fs::read(&p)?;
-        let state = bincode_decode(&bytes)?;
-        Ok(state)
+    /// Whether a saved state file already exists for this key.
+    pub fn exists(&self, key: &str) -> bool {
+        self.path(key).exists()
     }
 
     pub fn clear(&self, key: &str) -> Result<()> {
@@ -97,14 +62,4 @@ impl ContextMemory {
         }
         Ok(())
     }
-}
-
-// Minimal bincode-compatible encode/decode using serde_json for now.
-// Replace with actual bincode crate for smaller/faster serialisation.
-fn bincode_encode(state: &ModelState) -> Result<Vec<u8>> {
-    Ok(serde_json::to_vec(state)?)
-}
-
-fn bincode_decode(bytes: &[u8]) -> Result<ModelState> {
-    Ok(serde_json::from_slice(bytes)?)
 }

@@ -1,11 +1,13 @@
 /*!
 Expert Model Registry — three-tier memory manager.
 
-  🔥 Hot  — expert model constructed and resident (VRAM via candle device)
+  🔥 Hot  — expert model constructed and resident (CPU/GPU placement per
+            llama.cpp's own n_gpu_layers, no separate device handle to hold)
   🟡 Warm — evicted from hot but kept in the LRU cache (fast re-promotion,
-            no re-download or re-mmap needed)
+            no re-download needed)
   💤 Cold — only the config is known; nothing constructed yet. Promotion
-            downloads (or hits the HF Hub disk cache) and mmaps the checkpoint.
+            downloads (or hits the HF Hub disk cache) and mmaps the GGUF file
+            (llama.cpp mmaps internally — no separate memmap2 layer needed).
 
 Since each expert is now a full standalone pretrained model rather than a
 tiny LoRA delta, promotion/demotion moves much more data than the original
@@ -15,14 +17,12 @@ checkpoints instead of training our own adapters (see config.rs comments).
 
 use std::{
     collections::HashMap,
-    fs,
     num::NonZeroUsize,
     path::PathBuf,
     sync::{Arc, RwLock},
 };
 
 use anyhow::{Context, Result};
-use candle_core::Device;
 use lru::LruCache;
 
 use crate::config::ExpertConfig;
@@ -40,7 +40,11 @@ struct RegistryInner {
     warm: LruCache<String, Arc<ExpertModel>>,
     /// Cold: config known, nothing constructed — promotion builds fresh
     cold_configs: HashMap<String, ExpertConfig>,
-    device: Device,
+    /// Passed straight through to `LlamaModelParams::with_n_gpu_layers` at
+    /// load time — no candle `Device` concept anymore, llama.cpp handles
+    /// CPU/GPU placement per-model via this layer count.
+    n_gpu_layers: u32,
+    n_ctx: u32,
 }
 
 pub struct ExpertRegistry {
@@ -48,13 +52,19 @@ pub struct ExpertRegistry {
 }
 
 impl ExpertRegistry {
-    pub fn new(_adapters_dir: PathBuf, warm_cache_size: usize, device: Device) -> Result<Self> {
+    pub fn new(
+        _adapters_dir: PathBuf,
+        warm_cache_size: usize,
+        n_gpu_layers: u32,
+        n_ctx: u32,
+    ) -> Result<Self> {
         let warm = LruCache::new(NonZeroUsize::new(warm_cache_size).unwrap());
         let inner = RegistryInner {
             hot: HashMap::new(),
             warm,
             cold_configs: HashMap::new(),
-            device,
+            n_gpu_layers,
+            n_ctx,
         };
 
         Ok(Self { inner: Arc::new(RwLock::new(inner)) })
@@ -91,7 +101,7 @@ impl ExpertRegistry {
             .with_context(|| format!("No registered expert for '{name}'"))?
             .clone();
 
-        let model = ExpertModel::load(&cfg, inner.device.clone())?;
+        let model = ExpertModel::load(&cfg, inner.n_gpu_layers, inner.n_ctx)?;
         let arc = Arc::new(model);
         inner.hot.insert(name.to_string(), Arc::clone(&arc));
         Ok(arc)

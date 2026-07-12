@@ -3,10 +3,11 @@ Temporary Brain Router sidecar.
 
 Wraps facebook/bart-large-mnli as a zero-shot classifier behind a tiny local
 HTTP endpoint. The Rust pipeline calls this over localhost instead of running
-BART natively, since candle has no BART support.
+BART natively, since neither candle nor llama.cpp has BART support.
 
-This is scaffolding: once a real SSM-based router is trained and loadable in
-candle, this whole file goes away and router.rs talks to it directly.
+This is scaffolding: once a real SSM-based router is trained and converted to
+GGUF, this whole file goes away and router.rs talks to it directly through
+the same llama.cpp path already used for the experts and critic.
 
 Run:
     pip install fastapi uvicorn transformers torch
