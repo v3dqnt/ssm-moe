@@ -20,3 +20,4 @@ pub mod memory {
     pub mod context;
 }
 pub mod pipeline;
+pub mod server;

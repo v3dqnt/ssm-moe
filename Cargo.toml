@@ -38,9 +38,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 
 # HTTP client — used by the Brain Router sidecar (router.rs, temporary until
-# a native SSM router is trained) and by the per-expert llama-server
-# subprocess manager (llama_server.rs).
+# a native SSM router is trained) and by the expert router server client
+# (experts/expert_router.rs).
 reqwest = { version = "0.12", features = ["blocking", "json"] }
+
+# HTTP server — OpenAI-compatible endpoint (server.rs) so the pipeline can be
+# plugged into Vivianne (or any other harness) as a custom-base-URL provider.
+axum = "0.7"
 
 [profile.release]
 opt-level = 3

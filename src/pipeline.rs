@@ -40,14 +40,20 @@ pub struct MoEPipeline {
     brain: BrainRouter,
     experts: ExpertRouter,
     critic: CriticModel,
-    context: ContextMemory,
     device: Device,
     /// Max re-route attempts before returning best effort output
     max_retries: usize,
 }
 
 impl MoEPipeline {
-    pub async fn new(config: MoEConfig, session_id: &str) -> Result<Self> {
+    /// Note: no longer takes a `session_id` — this pipeline is a single
+    /// shared instance serving every conversation (see `server.rs`), not
+    /// one instance per session. Spawning a fresh `ExpertRouter` (i.e. a
+    /// whole `llama-server` process) per session would be wasteful; instead
+    /// `run()` takes `session_id` per-call and constructs a cheap
+    /// `ContextMemory` on the fly (no I/O until save/load is actually
+    /// called, just namespaces filenames by session).
+    pub async fn new(config: MoEConfig) -> Result<Self> {
         let device = if cfg!(feature = "cuda") && candle_core::utils::cuda_is_available() {
             Device::new_cuda(0)?
         } else {
@@ -70,27 +76,21 @@ impl MoEPipeline {
         )
         .await?;
 
-        let context = ContextMemory::new(
-            session_id,
-            config.sessions_dir.clone(),
-        )?;
-
         Ok(Self {
             config,
             brain,
             experts,
             critic,
-            context,
             device,
             max_retries: 2,
         })
     }
 
-    pub fn run(&mut self, prompt: &str) -> Result<String> {
+    pub fn run(&mut self, session_id: &str, prompt: &str) -> Result<String> {
         let mut attempt = 0;
 
         loop {
-            match self.try_run(prompt) {
+            match self.try_run(session_id, prompt) {
                 Ok((output, verdict)) if verdict.passed => {
                     info!("Critic passed (score={:.2})", verdict.composite);
                     return Ok(output);
@@ -115,9 +115,11 @@ impl MoEPipeline {
         }
     }
 
-    fn try_run(&mut self, prompt: &str) -> Result<(String, crate::layers::critic::CriticVerdict)> {
+    fn try_run(&mut self, session_id: &str, prompt: &str) -> Result<(String, crate::layers::critic::CriticVerdict)> {
+        let context = ContextMemory::new(session_id, self.config.sessions_dir.clone())?;
+
         // 1. Load prior context
-        let prior_state = self.context.load("brain")?;
+        let prior_state = context.load("brain")?;
         let prior = if prior_state.is_empty() { None } else { Some(prior_state) };
 
         // 2. Brain Router → gate logits
@@ -173,7 +175,7 @@ impl MoEPipeline {
         let verdict = self.critic.verify(&fused)?;
 
         // 8. Persist new Brain hidden state
-        self.context.save("brain", &new_brain_state)?;
+        context.save("brain", &new_brain_state)?;
 
         Ok((fused, verdict))
     }
