@@ -1,28 +1,9 @@
-mod brain {
-    pub mod gate;
-    pub mod router;
-}
-mod config;
-mod experts {
-    pub mod model;
-    pub mod registry;
-}
-mod layers {
-    pub mod confidence;
-    pub mod critic;
-    pub mod fusion;
-}
-mod memory {
-    pub mod context;
-}
-mod pipeline;
-
 use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use config::MoEConfig;
-use pipeline::MoEPipeline;
+use ssm_moe::config::MoEConfig;
+use ssm_moe::pipeline::MoEPipeline;
 
 #[derive(Parser)]
 #[command(name = "ssm-moe", about = "SSM Mixture-of-Experts inference engine")]

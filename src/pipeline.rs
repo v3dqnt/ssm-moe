@@ -6,8 +6,10 @@ Full forward pass:
     → Decomposition (TODO: implement sub-task splitting)
     → Brain Router   (gate logits + context memory read)
     → Adaptive-K Gate (select K experts)
-    → Registry       (promote adapters to hot tier)
-    → Expert forward passes (via shared base)
+    → Expert Router  (llama.cpp's native multi-model router — see
+                       experts/expert_router.rs — loads/evicts on demand,
+                       no explicit activate/hibernate call needed here
+                       anymore)
     → Confidence check (activate backup if needed)
     → Fusion         (weighted blend)
     → Critic         (verify or re-route)
@@ -25,9 +27,8 @@ use crate::{
         router::BrainRouter,
     },
     config::MoEConfig,
-    experts::registry::ExpertRegistry,
+    experts::expert_router::ExpertRouter,
     layers::{
-        confidence::{check_confidence, ConfidenceHead},
         critic::CriticModel,
         fusion::weighted_fuse,
     },
@@ -37,7 +38,7 @@ use crate::{
 pub struct MoEPipeline {
     config: MoEConfig,
     brain: BrainRouter,
-    registry: ExpertRegistry,
+    experts: ExpertRouter,
     critic: CriticModel,
     context: ContextMemory,
     device: Device,
@@ -57,17 +58,10 @@ impl MoEPipeline {
 
         let brain = BrainRouter::load(&config, device.clone())?;
 
-        let registry = ExpertRegistry::new(
-            config.adapters_dir.clone(),
-            config.warm_cache_size,
-            device.clone(),
-        )?;
-
-        // Register each expert's pretrained-checkpoint config. Nothing is
-        // downloaded or constructed until the gate actually selects it.
-        for expert in &config.experts {
-            registry.register_cold(&expert.name, expert.clone())?;
-        }
+        // One persistent router server for all experts — see
+        // expert_router.rs doc comment for why this replaced per-expert
+        // subprocess spawning.
+        let experts = ExpertRouter::spawn(&config)?;
 
         let critic = CriticModel::load(
             &config.critic_model_id,
@@ -84,7 +78,7 @@ impl MoEPipeline {
         Ok(Self {
             config,
             brain,
-            registry,
+            experts,
             critic,
             context,
             device,
@@ -142,19 +136,16 @@ impl MoEPipeline {
             gate.k, selected_names, gate.entropy
         );
 
-        // 4. Promote selected adapters, hibernate rest
-        self.registry.evict_except(&selected_names);
-        for name in &selected_names {
-            self.registry.activate(name)?;
-        }
-
-        // 5. Run each active expert. Single active expert is the common case
-        // (adaptive-K biases toward k=1 for confident routing, and config
-        // defaults k_max=1 for the 8GB VRAM budget) so this is usually one pass.
+        // 4. Run each selected expert. The router server loads each on
+        // demand and evicts others per --models-max automatically — no
+        // explicit activate/hibernate call needed here. Single active
+        // expert is the common case (adaptive-K biases toward k=1 for
+        // confident routing, and config defaults k_max=1 for the 8GB VRAM
+        // budget) so this is usually one request.
         let mut expert_outputs: Vec<(String, String)> = Vec::with_capacity(selected_names.len());
         for name in &selected_names {
-            let expert = self.registry.activate(name)?;
-            let (text, _state) = expert.generate(
+            let text = self.experts.generate(
+                name,
                 prompt,
                 self.config.max_new_tokens,
                 self.config.temperature,
@@ -187,3 +178,8 @@ impl MoEPipeline {
         Ok((fused, verdict))
     }
 }
+
+// No custom Drop needed: `ExpertRouter` (the `experts` field) already kills
+// the router process in its own Drop impl, which llama.cpp's router in turn
+// shuts down its child model-processes for — Rust's default field-drop
+// order handles the rest.

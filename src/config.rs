@@ -1,47 +1,40 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Quantization level a pretrained expert checkpoint is loaded at.
-/// Each expert is now a distinct full model (pulled pretrained from HF Hub),
-/// not a LoRA delta on a shared base — so quantization is chosen per-expert
-/// to fit VRAM rather than derived from a shared rank/alpha config.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Quantization {
-    Fp32,
-    Bf16,
-    Int8,
-    Int4,
-}
-
-impl Quantization {
-    /// Rough bytes-per-parameter for VRAM estimation.
-    pub fn bytes_per_param(&self) -> f64 {
-        match self {
-            Quantization::Fp32 => 4.0,
-            Quantization::Bf16 => 2.0,
-            Quantization::Int8 => 1.0,
-            Quantization::Int4 => 0.5,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExpertConfig {
     pub name: String,
-    /// HuggingFace Hub repo id for this expert's full pretrained checkpoint,
-    /// e.g. "mistralai/Mamba-Codestral-7B-v0.1".
+    /// HuggingFace Hub repo id — kept as a human-readable label/provenance
+    /// record even though inference now goes through a local GGUF file, not
+    /// a live HF download of this repo.
     pub model_id: String,
-    pub quantization: Quantization,
+    /// Local path to the GGUF checkpoint llama-server actually loads.
+    /// Real quantization (unlike the candle path this replaced) — GGUF's
+    /// Q4_K_M etc. are mature and verified to fit the 8GB VRAM budget.
+    pub gguf_path: PathBuf,
+    /// Load mode – `Gpu` (default) runs the model on the GPU via `-ngl`.
+    /// `Cpu` forces a CPU‑only llama‑server (`--cpu` flag) which saves VRAM
+    /// at the cost of slower generation. This is useful for rarely used
+    /// experts such as the "creative" domain.
+    pub load_mode: LoadMode,
 }
 
 impl ExpertConfig {
-    pub fn new(name: &str, model_id: &str, quantization: Quantization) -> Self {
+    pub fn new(name: &str, model_id: &str, gguf_path: impl Into<PathBuf>) -> Self {
         Self {
             name: name.into(),
             model_id: model_id.into(),
-            quantization,
+            gguf_path: gguf_path.into(),
+            load_mode: LoadMode::Gpu,
         }
     }
+}
+
+/// Whether an expert should be launched on the GPU or CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub enum LoadMode {
+    Gpu,
+    Cpu,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,13 +47,22 @@ pub struct MoEConfig {
 
     pub critic_model_id: String,
 
-    // expert pool — each is a full pretrained checkpoint pulled from HF Hub
+    // expert pool — each is a full pretrained checkpoint, served locally via
+    // a per-expert llama-server subprocess (see experts/llama_server.rs)
     pub experts: Vec<ExpertConfig>,
 
     // routing
     pub k_max: usize,
     pub confidence_threshold: f32,
     pub critic_threshold: f32,
+
+    // llama-server process management
+    pub llama_server_exe: PathBuf,
+    pub llama_server_base_port: u16,
+    /// -ngl passed to llama-server — layers offloaded to GPU. High value
+    /// pushes as much as fits; llama.cpp caps it automatically if the model
+    /// has fewer layers or VRAM runs out.
+    pub n_gpu_layers: u32,
 
     // memory tiers
     pub adapters_dir: PathBuf,
@@ -88,29 +90,52 @@ impl Default for MoEConfig {
             critic_model_id: "state-spaces/mamba-130m-hf".into(),
 
             experts: vec![
-                // int4: 7B model, ~3.5GB VRAM, fits an 8GB card with headroom
-                // for router + critic + generation buffers.
-                ExpertConfig::new("coding", "mistralai/Mamba-Codestral-7B-v0.1", Quantization::Int4),
-                // Real Mamba-2 math specialist (PromptCoT curriculum), verified
-                // against candle's Mamba2Config field aliases before wiring in —
-                // see model.rs doc comment. Same 7B/4096-hidden shape as Codestral.
-                ExpertConfig::new("math", "xl-zhao/PromptCoT-Mamba-Math-7B", Quantization::Int4),
-                // OpenHermes-tuned Mamba-1, safetensors mirror we converted
-                // from the upstream pytorch_model.bin (clibrain/mamba-2.8b-
-                // instruct-openhermes) since candle can't load pickle files.
-                // Broad GPT-4-distilled instruction data — reasonable fit for
-                // both reasoning and general-purpose slots.
-                ExpertConfig::new("reasoning", "v3dqnt/mamba-2.8b-instruct-openhermes-st", Quantization::Int4),
-                ExpertConfig::new("general", "v3dqnt/mamba-2.8b-instruct-openhermes-st", Quantization::Int4),
+                // Q4_K_M GGUF, ~4GB VRAM, fits an 8GB card with headroom for
+                // the critic (CPU-only) and generation buffers.
+                ExpertConfig::new(
+                    "coding",
+                    "mistralai/Mamba-Codestral-7B-v0.1",
+                    "../models/codestral-mamba-q4_k_m.gguf",
+                ),
+                // Real Mamba-2 math specialist (PromptCoT curriculum). No
+                // pre-made GGUF existed — self-converted via llama.cpp's
+                // convert_hf_to_gguf.py + llama-quantize (Mamba2Model class
+                // explicitly supports this architecture by name).
+                ExpertConfig::new(
+                    "math",
+                    "xl-zhao/PromptCoT-Mamba-Math-7B",
+                    "../models/promptcot-math-q4_k_m.gguf",
+                ),
+                // OpenHermes-tuned Mamba-1, converted from the upstream
+                // pytorch_model.bin mirror we made earlier this session.
+                ExpertConfig::new(
+                    "reasoning",
+                    "v3dqnt/mamba-2.8b-instruct-openhermes-st",
+                    "../models/openhermes-2.8b-q4_k_m.gguf",
+                ),
+                ExpertConfig::new(
+                    "general",
+                    "v3dqnt/mamba-2.8b-instruct-openhermes-st",
+                    "../models/openhermes-2.8b-q4_k_m.gguf",
+                ),
                 // creative still on the generic mamba-chat placeholder — no
                 // dedicated creative-writing SSM found yet.
-                ExpertConfig::new("creative", "havenhq/mamba-chat", Quantization::Int4),
+                ExpertConfig {
+                    name: "creative".into(),
+                    model_id: "havenhq/mamba-chat".into(),
+                    gguf_path: "../models/mamba-chat-q4_k_m.gguf".into(),
+                    load_mode: LoadMode::Cpu,
+                },
             ],
 
             // one expert at a time — matches the 8GB VRAM budget decision
             k_max: 1,
             confidence_threshold: 0.70,
             critic_threshold: 0.75,
+
+            llama_server_exe: PathBuf::from("../llama.cpp/llama-server.exe"),
+            llama_server_base_port: 8100,
+            n_gpu_layers: 999, // offload everything; llama.cpp caps automatically
 
             adapters_dir: PathBuf::from("./adapters"),
             warm_cache_size: 3,

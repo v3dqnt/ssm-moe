@@ -25,7 +25,11 @@ THRESHOLD = 0.65  # matches the threshold validated during dataset labeling
 classifier = pipeline(
     "zero-shot-classification",
     model="facebook/bart-large-mnli",
-    device=0,  # set to -1 for CPU-only
+    # CPU, not GPU: same reasoning as the Critic (layers/critic.rs) — every
+    # byte of local 8GB VRAM should go to the active expert's GGUF, not
+    # compete with a classifier that runs once per turn and isn't latency
+    # critical.
+    device=-1,
 )
 
 
