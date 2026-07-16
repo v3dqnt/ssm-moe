@@ -58,6 +58,18 @@ python router_server.py
 
 Point your harness at `http://127.0.0.1:8090/v1` as an OpenAI-compatible base URL. Model id `ssm-moe`. Include a stable `user` field per session for context-memory isolation (or send an `x-session-id` header).
 
+### Wiring into Vivianne (this repo)
+
+Vivianne's provider registry already includes `ssm-moe` as an OpenAI-compatible provider with no default base URL (see `packages/gui/src-tauri/src/ai/provider_registry.rs`). To use it:
+
+1. Start the two processes above (`router_server.py` + `ssm-moe.exe --serve`).
+2. In Vivianne, add a model with these fields (via `cmd_agent_set_model` or the equivalent UI):
+   - `provider`: `ssm-moe`
+   - `api`: `openai-chat` (or whatever the `ApiKind::OpenAiChat` label resolves to in your UI)
+   - `base_url`: `http://127.0.0.1:8090/v1` (required — no default, since the port is user-chosen)
+   - `id` / `name`: `ssm-moe` (any label works; the router ignores the request's `model` field)
+3. Set any non-empty API key (`local`, `unused`, anything) — the ssm-moe server ignores the Authorization header but Vivianne's OpenAI client requires *some* value to be present.
+
 **One-shot / REPL mode:**
 
 ```
