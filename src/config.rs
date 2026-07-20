@@ -162,4 +162,55 @@ impl MoEConfig {
             .find(|e| e.name == name)
             .ok_or_else(|| anyhow::anyhow!("Unknown expert: {name}"))
     }
+
+    /// Pipeline-plumbing test config — swaps every expert for a small,
+    /// plain-LFS (non-Xet) transformer GGUF, verified to exist and download
+    /// reliably before committing (checked via HF's API, not assumed).
+    /// This is NOT the real architecture: the whole point of this project is
+    /// SSM/Mamba experts, and these are ordinary transformers used purely to
+    /// validate the router/gate/critic/HTTP plumbing fast, without waiting
+    /// on multi-GB Mamba conversions or fighting Xet-storage download
+    /// flakiness (see git history — Codestral's repo is Xet-backed and this
+    /// caused repeated download failures). Swap back to `default()` once
+    /// the pipeline is proven end-to-end.
+    pub fn testing_stub() -> Self {
+        let mut cfg = Self::default();
+
+        // Qwen3.5-based, 5.7GB Q4_K_M, plain LFS. Real coding-capable model,
+        // not a toy — good enough to sanity-check that generation quality
+        // looks plausible, not just that bytes come back.
+        let qwythos = ("empero-ai/Qwythos-9B-v2-GGUF", "../models/qwythos-9b-q4_k_m.gguf");
+        // 688MB Q4_K_M, plain LFS — the fast one, for iterating on the
+        // router/gate/critic plumbing without a multi-GB wait each time.
+        let minicpm = ("openbmb/MiniCPM5-1B-GGUF", "../models/minicpm5-1b-q4_k_m.gguf");
+
+        for expert in cfg.experts.iter_mut() {
+            let (model_id, gguf_path) = if expert.name == "coding" { qwythos } else { minicpm };
+            expert.model_id = model_id.to_string();
+            expert.gguf_path = gguf_path.into();
+            expert.load_mode = LoadMode::Gpu;
+        }
+
+        cfg
+    }
+
+    /// Drop experts whose GGUF file isn't on disk. Called once during
+    /// pipeline startup so the gate never routes to an unresolvable expert.
+    /// This lets the pipeline boot with a subset of models available
+    /// (Codestral present today, others downloading/converting) rather than
+    /// requiring all four before any request can be served.
+    pub fn filter_to_present_experts(&mut self) {
+        self.experts.retain(|e| {
+            if e.gguf_path.exists() {
+                true
+            } else {
+                tracing::warn!(
+                    "expert '{}' skipped — GGUF not found at {}",
+                    e.name,
+                    e.gguf_path.display()
+                );
+                false
+            }
+        });
+    }
 }

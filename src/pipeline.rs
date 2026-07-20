@@ -53,7 +53,7 @@ impl MoEPipeline {
     /// `run()` takes `session_id` per-call and constructs a cheap
     /// `ContextMemory` on the fly (no I/O until save/load is actually
     /// called, just namespaces filenames by session).
-    pub async fn new(config: MoEConfig) -> Result<Self> {
+    pub async fn new(mut config: MoEConfig) -> Result<Self> {
         let device = if cfg!(feature = "cuda") && candle_core::utils::cuda_is_available() {
             Device::new_cuda(0)?
         } else {
@@ -61,6 +61,17 @@ impl MoEPipeline {
         };
 
         info!("Initialising SSM MoE pipeline on {device:?}");
+
+        // Boot with only the experts whose GGUFs actually exist on disk.
+        // Requests routed by the Brain to a missing expert would otherwise
+        // trip a runtime error deep inside expert_router.rs's HTTP call.
+        config.filter_to_present_experts();
+        if config.experts.is_empty() {
+            anyhow::bail!(
+                "no expert GGUFs found on disk — see config.rs for the expected paths under ../models/"
+            );
+        }
+        info!("Serving {} expert(s): {:?}", config.n_experts(), config.expert_names());
 
         let brain = BrainRouter::load(&config, device.clone())?;
 

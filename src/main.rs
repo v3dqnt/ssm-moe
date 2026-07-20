@@ -27,6 +27,13 @@ struct Cli {
     /// Port for --serve mode
     #[arg(long, default_value_t = 8090)]
     port: u16,
+
+    /// Use small non-SSM transformer GGUFs (Qwythos-9B for coding,
+    /// MiniCPM5-1B for everything else) instead of the real Mamba experts —
+    /// for validating the router/gate/critic/HTTP plumbing quickly, not for
+    /// testing actual SSM inference. See MoEConfig::testing_stub().
+    #[arg(long)]
+    test_models: bool,
 }
 
 #[tokio::main]
@@ -36,7 +43,12 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let config = MoEConfig::default();
+    let config = if cli.test_models {
+        tracing::warn!("--test-models: using non-SSM transformer stand-ins (Qwythos/MiniCPM5), not the real Mamba experts");
+        MoEConfig::testing_stub()
+    } else {
+        MoEConfig::default()
+    };
     let mut pipeline = MoEPipeline::new(config).await?;
 
     if cli.serve {

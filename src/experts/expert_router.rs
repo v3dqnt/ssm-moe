@@ -168,17 +168,31 @@ impl Drop for ExpertRouter {
 /// `n-gpu-layers = 0` (the "creative" expert today); `LoadMode::Gpu` offloads
 /// everything — llama.cpp caps this automatically if the model has fewer
 /// layers or VRAM runs out.
+///
+/// Experts whose GGUF file is missing on disk are logged and skipped rather
+/// than treated as a fatal error: this lets the pipeline boot with only a
+/// subset of experts on disk (e.g. Codestral present, math/reasoning/etc.
+/// still downloading or unconverted). Missing experts will cause a routed
+/// request to fail at request-time with a clear "model not found" from
+/// llama.cpp rather than blocking every startup on all four downloads
+/// completing. At least one expert must resolve or startup still fails —
+/// otherwise the whole router server has nothing to serve.
 fn build_preset_ini(experts: &[ExpertConfig]) -> Result<String> {
     let mut ini = String::from("version = 1\n\n[*]\nc = 4096\n\n");
+    let mut resolved = 0usize;
 
     for expert in experts {
-        let gguf_path = fs::canonicalize(&expert.gguf_path).with_context(|| {
-            format!(
-                "expert '{}' GGUF not found at {} — run the model download/conversion step first",
-                expert.name,
-                expert.gguf_path.display()
-            )
-        })?;
+        let gguf_path = match fs::canonicalize(&expert.gguf_path) {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!(
+                    "expert '{}' GGUF not found at {} — skipping (routed requests to this expert will fail)",
+                    expert.name,
+                    expert.gguf_path.display()
+                );
+                continue;
+            }
+        };
 
         // canonicalize() on Windows prepends a \\?\ UNC prefix; llama.cpp's
         // path handling doesn't expect it, so strip it back off.
@@ -189,6 +203,14 @@ fn build_preset_ini(experts: &[ExpertConfig]) -> Result<String> {
             "[{}]\nmodel = {}\nn-gpu-layers = {}\n\n",
             expert.name, gguf_str, ngl_for_load_mode(expert.load_mode)
         ));
+        resolved += 1;
+    }
+
+    if resolved == 0 {
+        anyhow::bail!(
+            "no expert GGUFs found on disk — checked {} configured path(s); run the model download/conversion step before starting the server",
+            experts.len()
+        );
     }
 
     Ok(ini)

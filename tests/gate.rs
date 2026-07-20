@@ -50,3 +50,28 @@ fn config_expert_order_and_load_mode() {
     let creative_cfg = cfg.get_expert("creative").expect("creative expert missing");
     assert_eq!(creative_cfg.load_mode, LoadMode::Cpu, "creative expert is not marked as Cpu");
 }
+
+#[test]
+fn testing_stub_swaps_all_experts_to_gpu_transformers() {
+    let cfg = MoEConfig::testing_stub();
+
+    // Ordering/names must still match default() — only the underlying
+    // model_id/gguf_path/load_mode should differ, since the router/gate
+    // logic keys off expert name.
+    let expected = vec!["coding", "math", "reasoning", "general", "creative"];
+    let actual: Vec<_> = cfg.expert_names().into_iter().collect();
+    assert_eq!(expected, actual, "testing_stub changed expert ordering/names");
+
+    // Every expert (including "creative", CPU-only in default()) should be
+    // GPU here — this config exists to test fast, and small transformers
+    // are cheap enough to all sit on the GPU together.
+    for expert in &cfg.experts {
+        assert_eq!(expert.load_mode, LoadMode::Gpu, "'{}' should be GPU in testing_stub", expert.name);
+    }
+
+    let coding = cfg.get_expert("coding").unwrap();
+    assert!(coding.model_id.contains("Qwythos"), "coding expert should be Qwythos in testing_stub");
+
+    let math = cfg.get_expert("math").unwrap();
+    assert!(math.model_id.contains("MiniCPM5"), "non-coding experts should be MiniCPM5 in testing_stub");
+}
